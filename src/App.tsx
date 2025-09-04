@@ -1,157 +1,309 @@
-import { useEffect, useMemo, useState } from 'react'
-import { supabase } from './supabase'
-import liff from '@line/liff'
+// src/App.tsx
+import { useEffect, useMemo, useRef, useState } from 'react';
+import liff from '@line/liff';
+import { Swiper, SwiperSlide } from 'swiper/react';
+import 'swiper/css';
 
+import { supabase } from './supabase';
+import Chips from './components/Chips';
+import { haversineKm, etaSec, formatEta } from './utils/geo';
+
+/** ===== Types ===== */
 type Venue = {
-  id: string
-  name: string
-  veg_type?: string
-  price_bin?: string
-  reco_count: number
-  lat: number
-  lng: number
+  id: string;
+  name: string;
+  veg_type?: string;
+  price_bin?: string;
+  reco_count: number;
+  lat: number;
+  lng: number;
+};
+
+type LatLng = { lat: number; lng: number };
+
+/** ===== Custom origins (localStorage) ===== */
+const CUSTOM_KEYS = ['customA', 'customB'] as const;
+type CustomKey = (typeof CUSTOM_KEYS)[number];
+
+function loadCustomPoint(key: CustomKey): LatLng | null {
+  try {
+    const raw = localStorage.getItem(`veg-origin:${key}`);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (typeof obj?.lat === 'number' && typeof obj?.lng === 'number') return obj;
+  } catch {}
+  return null;
 }
 
+function saveCustomPoint(key: CustomKey, p: LatLng) {
+  localStorage.setItem(`veg-origin:${key}`, JSON.stringify(p));
+}
+
+/** ===== Quick origins =====
+ *  my = 目前定位（geolocation）
+ *  其他 = 固定點（可含兩個使用者自訂）
+ */
+const QUICK_ORIGINS = [
+  { key: 'my', label: '目前位置' as const }, // no lat/lng here
+  { key: 'kuangfu', label: '成大光復門', lat: 22.9976, lng: 120.2191 },
+  { key: 'chenggong', label: '成大成功門', lat: 22.9949, lng: 120.2199 },
+  // 兩個自訂：先用 placeholder；渲染時會以 localStorage 的值覆寫
+  { key: 'customA', label: '自訂 A', lat: 0, lng: 0 },
+  { key: 'customB', label: '自訂 B', lat: 0, lng: 0 },
+] as const;
+
+type OriginKey = (typeof QUICK_ORIGINS)[number]['key'];
+type FixedOrigin = Extract<(typeof QUICK_ORIGINS)[number], { lat: number; lng: number }>;
+const isFixedOrigin = (o: any): o is FixedOrigin =>
+  o && typeof o.lat === 'number' && typeof o.lng === 'number';
+
+const TIME_OPTIONS = [
+  { label: '10 分', value: 10 },
+  { label: '15 分', value: 15 },
+  { label: '15+ 分', value: 999 },
+] as const;
+
 export default function App() {
-  const [venues, setVenues] = useState<Venue[]>([])
-  const [loading, setLoading] = useState(true)
-  const [liffReady, setLiffReady] = useState(false)
-  const [liffError, setLiffError] = useState<string | null>(null)
-  const [uiMsg, setUiMsg] = useState<string | null>(null)
+  const [venues, setVenues] = useState<Venue[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const liffId = import.meta.env.VITE_LIFF_ID as string | undefined
-  const inLineClient = useMemo(() => {
-    // 在 LINE App 內會成立；一般桌面瀏覽器不是
-    try {
-      return typeof window !== 'undefined' && (liff as any)?.isInClient?.()
-    } catch { return false }
-  }, [])
+  const [originKey, setOriginKey] = useState<OriginKey>('my');
+  const [origin, setOrigin] = useState<LatLng | null>(null);
+  const [minutes, setMinutes] = useState<number>(15);
 
-  // 只要有設定 LIFF_ID 就初始化；在非 LINE 環境不強制 login，避免白畫面
+  const swiperRef = useRef<any>(null);
+
+  // user_hash：預設 dev，LIFF 之後覆寫
+  const [userHash, setUserHash] = useState<string>(
+    'dev-' + btoa(navigator.userAgent).slice(0, 16),
+  );
+
+  /** ===== LIFF 身份綁定 ===== */
   useEffect(() => {
-    if (!liffId) {
-      setUiMsg('⚠️ 未設定 VITE_LIFF_ID，LIFF 登入略過。')
-      return
-    }
-    if (typeof window === 'undefined') return
+    const liffId = import.meta.env.VITE_LIFF_ID as string | undefined;
+    if (!liffId) return;
 
-    liff.init({ liffId })
+    liff
+      .init({ liffId, withLoginOnExternalBrowser: true })
       .then(() => {
-        setLiffReady(true)
-        if (inLineClient) {
-          // 只有在 LINE 內才啟動登入流程
-          if (!liff.isLoggedIn()) {
-            liff.login({ redirectUri: window.location.href })
-          }
-        } else {
-          setUiMsg('（非 LINE 環境，已略過 LIFF 登入以便本機/桌面測試）')
+        if (!liff.isLoggedIn()) {
+          liff.login({ redirectUri: window.location.href });
+          return;
         }
-      })
-      .catch(err => {
-        console.error('LIFF init 失敗', err)
-        setLiffError(String(err))
-      })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liffId])
-
-  // 讀資料
-  async function load() {
-    try {
-      setLoading(true)
-      const { data, error } = await supabase
-        .from('venues')
-        .select('id,name,veg_type,price_bin,reco_count,lat,lng')
-        .eq('status', 'published')
-        .order('reco_count', { ascending: false })
-        .limit(20)
-
-      if (error) throw error
-      setVenues(data || [])
-    } catch (e: any) {
-      console.error('讀取 venues 失敗', e)
-      setUiMsg(`讀取資料失敗：${e?.message ?? e}`)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // 投票：在 LINE 內用 LIFF 身分，否則用 dev hash（方便本機測試）
-  async function upvote(id: string) {
-    let user_hash = 'dev-' + btoa(navigator.userAgent).slice(0, 16)
-
-    try {
-      if (liffReady && liff.isLoggedIn()) {
-        const idToken = liff.getIDToken()
+        const idToken = liff.getIDToken();
         if (idToken) {
-          user_hash = 'liffToken-' + idToken.slice(0, 32)
+          setUserHash('liffToken-' + idToken.slice(0, 32));
         } else {
-          try {
-            const profile = await liff.getProfile()
-            if (profile?.userId) user_hash = 'liffUid-' + profile.userId
-          } catch { /* 如果拿不到 profile 就維持原本 user_hash */ }
+          liff
+            .getProfile()
+            .then((p) => {
+              if (p?.userId) setUserHash('liffUid-' + p.userId);
+            })
+            .catch(() => {});
         }
-      }
-    } catch (e) {
-      console.warn('取得 LIFF 身分失敗，改用 dev hash。', e)
+      })
+      .catch(() => {});
+  }, []);
+
+  /** ===== 讀資料 ===== */
+  async function load() {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('venues')
+      .select('id,name,veg_type,price_bin,reco_count,lat,lng')
+      .eq('status', 'published')
+      .limit(100);
+    if (error) alert(error.message);
+    setVenues(data || []);
+    setLoading(false);
+
+    await logEvent('view');
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  /** ===== 起點：my -> geolocation；其他 -> 固定座標（含自訂） ===== */
+  useEffect(() => {
+    // 先把 customA/customB（如果有）覆寫到 QUICK_ORIGINS 這兩個項目
+    const customA = loadCustomPoint('customA');
+    const customB = loadCustomPoint('customB');
+    if (customA) {
+      (QUICK_ORIGINS as any)[3].lat = customA.lat;
+      (QUICK_ORIGINS as any)[3].lng = customA.lng;
+    }
+    if (customB) {
+      (QUICK_ORIGINS as any)[4].lat = customB.lat;
+      (QUICK_ORIGINS as any)[4].lng = customB.lng;
     }
 
-    try {
-      const { data, error } = await supabase.rpc('fn_upvote', {
-        p_user_hash: user_hash,
-        p_venue_id: id,
-      })
-      if (error) throw error
+    if (originKey === 'my') {
+      if (!navigator.geolocation) {
+        setOrigin(null);
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => setOrigin({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => setOrigin(null),
+        { enableHighAccuracy: true, timeout: 6000 },
+      );
+    } else {
+      const target = QUICK_ORIGINS.find((x) => x.key === originKey);
+      if (target && isFixedOrigin(target)) {
+        setOrigin({ lat: target.lat, lng: target.lng });
+      } else {
+        setOrigin(null);
+      }
+    }
+  }, [originKey]);
 
-      const newCount = data as number
-      setVenues(prev => prev.map(v => v.id === id ? { ...v, reco_count: newCount } : v))
-    } catch (e: any) {
-      alert(`投票失敗：${e?.message ?? e}`)
+  /** ===== 篩選 & 排序（近似 ETA） ===== */
+  const filtered = useMemo(() => {
+    if (!origin) return venues;
+
+    const rows = venues.map((v) => {
+      const distKm = haversineKm(origin, { lat: v.lat, lng: v.lng });
+      const sec = etaSec(distKm, 'walk');
+      return { ...v, _distKm: distKm, _etaSec: sec };
+    });
+
+    const within = rows.filter((r) => r._etaSec <= minutes * 60 || minutes >= 999);
+    within.sort((a, b) => a._etaSec - b._etaSec || b.reco_count - a.reco_count);
+    return within;
+  }, [venues, origin, minutes]);
+
+  /** ===== 事件紀錄 ===== */
+  async function logEvent(
+    evt: 'view' | 'swipe' | 'upvote' | 'nav',
+    venueId?: string,
+    meta: any = {},
+  ) {
+    try {
+      await supabase.from('app_events').insert({
+        user_hash: userHash,
+        venue_id: venueId ?? null,
+        event: evt,
+        meta,
+      });
+    } catch {}
+  }
+
+  /** ===== +1 推薦 ===== */
+  async function upvote(id: string) {
+    const { data, error } = await supabase.rpc('fn_upvote', {
+      p_user_hash: userHash,
+      p_venue_id: id,
+    });
+    if (error) return alert(error.message);
+    const newCount = data as number;
+    setVenues((prev) => prev.map((x) => (x.id === id ? { ...x, reco_count: newCount } : x)));
+    logEvent('upvote', id);
+  }
+
+  /** ===== 設定自訂起點（A/B） ===== */
+  function promptSetCustom(key: CustomKey) {
+    const lat = Number(prompt('輸入緯度 (lat) 如 22.9976'));
+    const lng = Number(prompt('輸入經度 (lng) 如 120.2191'));
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      const p = { lat, lng };
+      saveCustomPoint(key, p);
+      // 若正在使用該自訂點，立刻套用
+      if (originKey === key) setOrigin(p);
+      alert(`已更新 ${key.toUpperCase()}：${lat}, ${lng}`);
+    } else {
+      alert('格式不正確，請重新輸入數字');
     }
   }
 
-  // 首次載入
-  useEffect(() => { load() }, [])
+  if (loading) return <div style={{ padding: 24 }}>載入中…</div>;
 
   return (
-    <div style={{ padding: 16, maxWidth: 520, margin: '0 auto' }}>
-      <h1>附近蔬食（MVP）</h1>
+    <div style={{ padding: 16, maxWidth: 560, margin: '0 auto' }}>
+      <h1 style={{ marginBottom: 4 }}>附近蔬食（MVP）</h1>
 
-      {/* 顯示一些狀態，方便除錯 */}
-      {uiMsg && <div style={{ margin: '8px 0', opacity: 0.75 }}>{uiMsg}</div>}
-      {liffError && (
-        <div style={{ color: 'tomato', margin: '8px 0' }}>
-          LIFF 錯誤：{liffError}
+      {/* 出發點 chips */}
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontSize: 13, opacity: 0.7 }}>出發點</div>
+        <Chips
+          value={originKey}
+          onChange={setOriginKey}
+          options={QUICK_ORIGINS.map((o) => ({ label: o.label as string, value: o.key }))}
+        />
+        <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
+          <button onClick={() => promptSetCustom('customA')}>設定自訂 A</button>
+          <button onClick={() => promptSetCustom('customB')}>設定自訂 B</button>
         </div>
-      )}
+      </div>
 
-      {loading && <div style={{ padding: 24 }}>載入中…</div>}
+      {/* 時圈 chips */}
+      <div style={{ marginTop: 12 }}>
+        <div style={{ fontSize: 13, opacity: 0.7 }}>時圈</div>
+        <Chips value={minutes} onChange={setMinutes} options={TIME_OPTIONS as any} />
+      </div>
 
-      {!loading && venues.length === 0 && (
-        <div style={{ padding: 12, opacity: 0.8 }}>
-          沒有資料（確認 Supabase 表 `venues` 是否有 `status='published'` 的列）
-        </div>
-      )}
+      {/* 卡片（swiper） */}
+      <div style={{ marginTop: 12 }}>
+        <Swiper
+          onSwiper={(s) => (swiperRef.current = s)}
+          onSlideChange={(s) => {
+            const v = filtered[s.activeIndex];
+            if (v) logEvent('swipe', v.id);
+          }}
+          spaceBetween={16}
+          slidesPerView={1}
+          centeredSlides
+          style={{ paddingBottom: 24 }}
+        >
+          {filtered.map((v) => {
+            const distKm = origin ? haversineKm(origin, { lat: v.lat, lng: v.lng }) : undefined;
+            const sec = distKm ? etaSec(distKm, 'walk') : undefined;
 
-      {venues.map(v => (
-        <div key={v.id}
-          style={{ padding: 12, margin: '12px 0', border: '1px solid #ddd', borderRadius: 12 }}>
-          <div style={{ fontWeight: 600 }}>{v.name}</div>
-          <div style={{ opacity: 0.7, fontSize: 14 }}>
-            {(v.veg_type || '蔬食')} · {(v.price_bin || '$')} · 👍 {v.reco_count}
+            return (
+              <SwiperSlide key={v.id}>
+                <div
+                  style={{
+                    border: '1px solid #e5e7eb',
+                    borderRadius: 16,
+                    padding: 14,
+                    background: 'white',
+                    boxShadow: '0 4px 16px rgba(0,0,0,.06)',
+                  }}
+                >
+                  <div style={{ fontWeight: 700, fontSize: 18 }}>{v.name}</div>
+                  <div style={{ opacity: 0.75, marginTop: 4 }}>
+                    {(v.veg_type || '蔬食')} · {(v.price_bin || '$')} · 👍 {v.reco_count}
+                    {sec ? ` · ${formatEta(sec)}` : ''}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    <button onClick={() => upvote(v.id)}>+1 推薦</button>
+                    <a
+                      href={`https://www.google.com/maps/dir/?api=1&destination=${v.lat},${v.lng}&travelmode=walking`}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={() =>
+                        logEvent('nav', v.id, {
+                          origin,
+                          eta_sec: sec,
+                        })
+                      }
+                    >
+                      導航
+                    </a>
+                  </div>
+                </div>
+              </SwiperSlide>
+            );
+          })}
+        </Swiper>
+
+        {filtered.length === 0 && (
+          <div style={{ padding: 16, opacity: 0.7 }}>
+            這個時圈沒有找到店家，換個出發點或拉長時間看看～
           </div>
-          <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-            <button onClick={() => upvote(v.id)}>+1 推薦</button>
-            <a
-              href={`https://www.google.com/maps/dir/?api=1&destination=${v.lat},${v.lng}&travelmode=walking`}
-              target="_blank"
-            >
-              導航
-            </a>
-          </div>
-        </div>
-      ))}
-
-      <button onClick={load} style={{ marginTop: 8 }}>重新整理</button>
+        )}
+      </div>
     </div>
-  )
+  );
 }
